@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-ai-harness-tester"
+version = "0.1.0"
+description = "Persistent local harness benchmarks and machine-scoped parameter recommendations"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+local-ai-harness-tester = "harness_tester:main"
+local-ai-harness-web = "web_ui:main"
+
+[tool.setuptools]
+py-modules = ["harness_tester", "evaluations", "hardware", "web_ui", "runtime_adapters"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pylint.main]
+py-version = "3.10"
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint.messages_control]
+disable = [
+  "missing-module-docstring",
+  "missing-class-docstring",
+  "missing-function-docstring",
+  "too-few-public-methods",
+  "too-many-locals",
+  "too-many-branches",
+  "too-many-statements",
+  "too-many-return-statements",
+  "too-many-lines",
+  "duplicate-code",
+  "unidiomatic-typecheck",
+  "import-outside-toplevel",
+  "cyclic-import",
+]
+
+[tool.pylint.basic]
+good-names = ["do_GET", "do_POST"]
+
+[tool.mypy]
+python_version = "3.10"
+check_untyped_defs = true
+files = ["harness_tester.py", "evaluations.py", "hardware.py", "web_ui.py", "runtime_adapters.py"]

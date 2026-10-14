@@ -1,0 +1,19 @@
+{
+  "model": "synthetic-media-v1",
+  "harness": "synthetic-media-harness-v1",
+  "command": ["python3", "multimodal_harness.py"],
+  "cases": [
+    {
+      "id": "image",
+      "task": "generation",
+      "input": {
+        "parts": [
+          {"type": "text", "text": "Describe this image"},
+          {"type": "image", "path": "sample.svg", "mime_type": "image/svg+xml"}
+        ]
+      }
+    }
+  ],
+  "repetitions": 2,
+  "timeout_seconds": 10
+}

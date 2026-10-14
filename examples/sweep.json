@@ -1,0 +1,16 @@
+{
+  "model": "synthetic-demo-v1",
+  "harness": "demo-harness-v1",
+  "command": ["python3", "demo_harness.py"],
+  "cases": [
+    {"id": "first", "input": "First example"},
+    {"id": "second", "input": "Second example"}
+  ],
+  "parameter_grid": {
+    "demo_score": [0.7, 0.9],
+    "delay_seconds": [0.01, 0.05]
+  },
+  "repetitions": 3,
+  "timeout_seconds": 10,
+  "seed": 42
+}

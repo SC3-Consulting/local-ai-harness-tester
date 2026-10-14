@@ -1,0 +1,26 @@
+{
+  "model": "synthetic-embedding-v1",
+  "harness": "synthetic-embedding-harness-v1",
+  "command": ["python3", "embedding_harness.py"],
+  "cases": [
+    {
+      "id": "reference",
+      "task": "embedding",
+      "input": "A cat sits on a mat",
+      "evaluation": {"metric": "cosine_similarity", "reference": [1.0, 0.0]}
+    },
+    {
+      "id": "retrieval",
+      "task": "embedding",
+      "input": "Find the cat",
+      "documents": [
+        {"id": "relevant", "input": "A cat sits on a mat"},
+        {"id": "unrelated", "input": "A boat sails on the sea"}
+      ],
+      "evaluation": {"metric": "retrieval", "relevant_ids": ["relevant"], "k": 1}
+    }
+  ],
+  "parameter_grid": {"variant": ["aligned", "misaligned"]},
+  "repetitions": 3,
+  "timeout_seconds": 10
+}
