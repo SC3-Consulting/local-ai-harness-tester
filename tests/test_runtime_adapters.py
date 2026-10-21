@@ -1,8 +1,11 @@
 import base64
+import http.server
 import io
 import json
 import os
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -577,7 +580,7 @@ class AirLLMTests(unittest.TestCase):
             (
                 "load",
                 str(model_path),
-                {},
+                {"device": "cpu"},
                 "1",
                 "1",
             ),
@@ -604,6 +607,53 @@ class AirLLMTests(unittest.TestCase):
             },
         )
         self.assertEqual(model.tokenizer.decoded, ([21, 22], True))
+
+    def test_airllm_chat_template_trims_user_text_and_defaults_max_new_tokens(self):
+        class FakeTokenizer:
+            chat_template = "x"
+
+            def __init__(self):
+                self.encoded = None
+
+            def apply_chat_template(self, messages, add_generation_prompt, tokenize):
+                return "<u>" + messages[0]["content"] + "<a>"
+
+            def __call__(self, text, **kwargs):
+                if text == "<u><a>" or text == "abcdef":
+                    return {"input_ids": list(text)}
+                self.encoded = (text, kwargs)
+                return {"input_ids": [[1, 2, 3]]}
+
+            def decode(self, tokens, skip_special_tokens=True):
+                return "".join(tokens) if tokens and isinstance(tokens[0], str) else "out"
+
+        class FakeModel:
+            tokenizer = FakeTokenizer()
+
+            def generate(self, input_ids, **kwargs):
+                self.kwargs = kwargs
+                return [[1, 2, 3, 4]]
+
+        model = FakeModel()
+        fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
+        fake_airllm = types.SimpleNamespace(
+            AutoModel=types.SimpleNamespace(from_pretrained=lambda path, **kw: model)
+        )
+        model_path = Path(__file__).parent / "_runtime_adapter_model_fixture2"
+        model_path.mkdir()
+        self.addCleanup(model_path.rmdir)
+        request = {
+            "model": str(model_path),
+            "parameters": {"context_size": 8},
+            "case": {"input": "abcdef", "evaluation": {"metric": "exact_match", "expected": "x"}},
+        }
+        with patch.dict(sys.modules, {"torch": fake_torch, "airllm": fake_airllm}):
+            adapters.adapt(request, "airllm")
+        self.assertEqual(model.tokenizer.encoded[0], "<u>ab<a>")
+        self.assertEqual(
+            model.tokenizer.encoded[1], {"return_tensors": "pt", "add_special_tokens": False}
+        )
+        self.assertEqual(model.kwargs["max_new_tokens"], adapters.AIRLLM_DEFAULT_MAX_NEW_TOKENS)
 
     def test_airllm_rejects_embedding_unknown_options_and_remote_models(self):
         request = {
@@ -671,6 +721,133 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(output.getvalue(), "")
         self.assertIn("endpoint must be", errors.getvalue())
+
+
+class StreamTests(unittest.TestCase):
+    """Streaming and time-to-first-token, against a real local HTTP server."""
+
+    def serve(self, lines, first_delay=0.2, gap=0.05):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.end_headers()
+                time.sleep(first_delay)
+                try:
+                    for line in lines:
+                        self.wfile.write(line.encode() + b"\n")
+                        self.wfile.flush()
+                        time.sleep(gap)
+                except OSError:
+                    pass  # the client gave up, as in the timeout test
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}", seen
+
+    def request(self, task="generation", parameters=None):
+        case = {"input": "hi", "evaluation": {"metric": "json"}}
+        return {"model": "m", "parameters": parameters or {}, "case": {**case, "task": task}}
+
+    def test_json_mode_maps_to_each_runtimes_native_field(self):
+        parameters = {"response_format": "json", "temperature": 0}
+        endpoint, seen = self.serve([json.dumps({"done": True})])
+        adapters.adapt(self.request(parameters=parameters), "ollama", endpoint, 10, stream=True)
+        self.assertEqual(seen[0]["format"], "json")
+        self.assertEqual(seen[0]["options"], {"temperature": 0.0})
+        endpoint, seen = self.serve(["data: [DONE]"])
+        adapters.adapt(self.request(parameters=parameters), "llama.cpp", endpoint, 10, stream=True)
+        self.assertEqual(seen[0]["response_format"], {"type": "json_object"})
+        endpoint, seen = self.serve([json.dumps({"done": True})])
+        adapters.adapt(self.request(parameters={"temperature": 0}), "ollama", endpoint, 10, True)
+        self.assertNotIn("format", seen[0])
+
+    def test_json_mode_rejects_other_values_and_unsupported_runtimes(self):
+        for runtime in ("ollama", "llama.cpp"):
+            with self.subTest(runtime=runtime), self.assertRaisesRegex(ValueError, "'json'"):
+                adapters.adapt(
+                    self.request(parameters={"response_format": "xml"}), runtime, None, 10
+                )
+        with self.assertRaisesRegex(ValueError, "colibri does not support"):
+            adapters.adapt(self.request(parameters={"response_format": "json"}), "colibri")
+
+    def test_ollama_stream_reports_ttft_and_decode_time(self):
+        lines = [
+            json.dumps({"message": {"content": "a"}, "done": False}),
+            json.dumps({"message": {"content": "b"}, "done": False}),
+            json.dumps({"message": {"content": ""}, "done": True, "eval_count": 2}),
+        ]
+        endpoint, seen = self.serve(lines)
+        result = adapters.adapt(self.request(), "ollama", endpoint, 10, stream=True)
+        self.assertTrue(seen[0]["stream"])
+        self.assertEqual((result["output"], result["output_tokens"]), ("ab", 2))
+        self.assertGreaterEqual(result["ttft_seconds"], 0.2)
+        self.assertLess(result["ttft_seconds"], 5)
+        self.assertGreaterEqual(result["decode_seconds"], 0.04)
+
+    def test_openai_stream_reads_sse_usage_and_ignores_role_chunk(self):
+        def sse(payload):
+            return "data: " + json.dumps(payload)
+
+        lines = [
+            sse({"choices": [{"delta": {"role": "assistant"}}]}),
+            "",
+            sse({"choices": [{"delta": {"content": "x"}}]}),
+            sse({"choices": [{"delta": {"content": "y"}}]}),
+            sse({"choices": [], "usage": {"completion_tokens": 2}}),
+            "data: [DONE]",
+        ]
+        endpoint, seen = self.serve(lines)
+        result = adapters.adapt(self.request(), "llama.cpp", endpoint, 10, stream=True)
+        self.assertEqual(seen[0]["stream_options"], {"include_usage": True})
+        self.assertEqual((result["output"], result["output_tokens"]), ("xy", 2))
+        self.assertGreaterEqual(result["ttft_seconds"], 0.2)
+
+    def test_streams_report_prompt_tokens_and_finish_reason(self):
+        done = {"message": {"content": ""}, "done": True, "done_reason": "length"}
+        done.update(eval_count=2, prompt_eval_count=37)
+        endpoint, _ = self.serve([json.dumps({"message": {"content": "a"}}), json.dumps(done)])
+        result = adapters.adapt(self.request(), "ollama", endpoint, 10, stream=True)
+        self.assertEqual((result["prompt_tokens"], result["finish_reason"]), (37, "length"))
+        chunks = [
+            {"choices": [{"delta": {"content": "x"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "length"}]},
+            {"choices": [], "usage": {"completion_tokens": 1, "prompt_tokens": 34}},
+        ]
+        endpoint, _ = self.serve(["data: " + json.dumps(c) for c in chunks] + ["data: [DONE]"])
+        result = adapters.adapt(self.request(), "llama.cpp", endpoint, 10, stream=True)
+        self.assertEqual(
+            (result["output_tokens"], result["prompt_tokens"], result["finish_reason"]),
+            (1, 34, "length"),
+        )
+
+    def test_stream_without_text_omits_timings_and_error_chunks_fail(self):
+        endpoint, _ = self.serve([json.dumps({"done": True, "eval_count": 0})])
+        result = adapters.adapt(self.request(), "ollama", endpoint, 10, stream=True)
+        self.assertEqual(result, {"output": "", "output_tokens": 0})
+        endpoint, _ = self.serve([json.dumps({"error": "model runner crashed"})])
+        with self.assertRaisesRegex(RuntimeError, "model runner crashed"):
+            adapters.adapt(self.request(), "ollama", endpoint, 10, stream=True)
+
+    def test_stream_overall_timeout_is_reported_as_timed_out(self):
+        line = json.dumps({"message": {"content": "a"}, "done": False})
+        endpoint, _ = self.serve([line] * 20, first_delay=0, gap=0.1)
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            adapters.adapt(self.request(), "ollama", endpoint, 0.5, stream=True)
+
+    def test_stream_is_limited_to_generation_on_supported_runtimes(self):
+        for runtime in ("airllm", "colibri"):
+            with self.subTest(runtime=runtime), self.assertRaisesRegex(ValueError, "--stream"):
+                adapters.adapt(self.request(), runtime, None, 10, stream=True)
+        with self.assertRaisesRegex(ValueError, "generation requests only"):
+            adapters.adapt(self.request("embedding"), "ollama", "http://127.0.0.1:1", 10, True)
 
 
 if __name__ == "__main__":

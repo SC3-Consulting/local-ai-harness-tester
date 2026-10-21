@@ -11,6 +11,7 @@ A Python 3.10+ local benchmark CLI and Web UI for WSL/Linux. The benchmark core 
 - Use a local HTTP UI to configure sweeps, run tests, inspect results, compare runs, and request recommendations.
 - Discover CPU, RAM, GPU, driver, and VRAM telemetry when available.
 - Evaluate exact answers and strict JSON output without trusting a model to grade itself.
+- Search for the largest context and prompt size that an Ollama or llama.cpp model completes within a timeout, and record time to first token and decode speed; see [AUTO_TUNER.md](AUTO_TUNER.md).
 
 ## Web UI and local runtimes
 
@@ -345,9 +346,9 @@ an explanatory message instead of a chart.
 `requirements.txt` includes pytest, isort, Black, Pylint, and mypy. Configuration lives in `pyproject.toml`. Run the same checks as CI:
 
 ```sh
-.venv/bin/python -m isort --check-only harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py tests examples
-.venv/bin/python -m black --check harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py tests examples
-.venv/bin/python -m pylint harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py
+.venv/bin/python -m isort --check-only harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py auto_tuner.py tests examples
+.venv/bin/python -m black --check harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py auto_tuner.py tests examples
+.venv/bin/python -m pylint harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py auto_tuner.py
 .venv/bin/python -m mypy
 .venv/bin/python -m pytest -q
 ```
