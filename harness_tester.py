@@ -352,8 +352,8 @@ def machine_info():
 
 
 def environment_info():
-    """Retrieve comprehensive information about the current environment, including machine details, memory inventory, and GPU telemetry.
-
+    """Retrieve comprehensive information about the current environment, including machine
+    details, memory inventory, and GPU telemetry.
     Returns:
         dict: Environment information including machine info, memory inventory, and GPU telemetry.
     """

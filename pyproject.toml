@@ -12,9 +12,10 @@ dependencies = []
 [project.scripts]
 local-ai-harness-tester = "harness_tester:main"
 local-ai-harness-web = "web_ui:main"
+local-ai-auto-tuner = "auto_tuner:main"
 
 [tool.setuptools]
-py-modules = ["harness_tester", "evaluations", "hardware", "web_ui", "runtime_adapters"]
+py-modules = ["harness_tester", "evaluations", "hardware", "web_ui", "runtime_adapters", "auto_tuner"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -40,6 +41,9 @@ disable = [
   "missing-class-docstring",
   "missing-function-docstring",
   "too-few-public-methods",
+  "too-many-arguments",
+  "too-many-positional-arguments",
+  "too-many-instance-attributes",
   "too-many-locals",
   "too-many-branches",
   "too-many-statements",
@@ -57,4 +61,4 @@ good-names = ["do_GET", "do_POST"]
 [tool.mypy]
 python_version = "3.10"
 check_untyped_defs = true
-files = ["harness_tester.py", "evaluations.py", "hardware.py", "web_ui.py", "runtime_adapters.py"]
+files = ["harness_tester.py", "evaluations.py", "hardware.py", "web_ui.py", "runtime_adapters.py", "auto_tuner.py"]

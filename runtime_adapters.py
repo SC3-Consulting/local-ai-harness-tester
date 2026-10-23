@@ -16,6 +16,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
@@ -537,6 +538,9 @@ def _openai_params(params: dict[str, Any], runtime: str, allowed: set[str]) -> d
         result["stop"] = _stops("stop", params["stop"])
     if "seed" in params:
         result["seed"] = _integer("seed", params["seed"], minimum=0)
+    if "response_format" in params:
+        _json_mode(params["response_format"])
+        result["response_format"] = {"type": "json_object"}
     if "frequency_penalty" in params:
         result["frequency_penalty"] = _number(
             "frequency_penalty", params["frequency_penalty"], minimum=-2, maximum=2
@@ -548,8 +552,18 @@ def _openai_params(params: dict[str, Any], runtime: str, allowed: set[str]) -> d
     return result
 
 
+def _json_mode(value: Any) -> bool:
+    """Validate the ``response_format`` parameter; only ``"json"`` is supported."""
+    if value != "json":
+        raise ValueError("parameter response_format must be 'json'")
+    return True
+
+
 def _finish_generation(
-    request: dict[str, Any], output: str, output_tokens: int | None = None
+    request: dict[str, Any],
+    output: str,
+    output_tokens: int | None = None,
+    timings: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Finalise the generation response.
 
@@ -557,6 +571,7 @@ def _finish_generation(
         request (dict[str, Any]): The original generation request.
         output (str): The generated output text.
         output_tokens (int | None, optional): The number of output tokens. Defaults to None.
+        timings (dict[str, float] | None, optional): Streaming measurements, merged when given.
 
     Returns:
         dict[str, Any]: The finalized generation response.
@@ -565,6 +580,7 @@ def _finish_generation(
     response: dict[str, Any] = {"output": output}
     if output_tokens is not None:
         response["output_tokens"] = output_tokens
+    response.update(timings or {})
     return response
 
 
@@ -648,13 +664,144 @@ def _embedding_response(vectors: list[Any], documents: list[tuple[str, str]]) ->
     return result
 
 
-def run_ollama(request: dict[str, Any], endpoint: str, timeout: float) -> dict[str, Any]:
+def _post_stream(
+    url: str, body: dict[str, Any], timeout: float, sse: bool
+) -> list[tuple[float, dict[str, Any]]]:
+    """POST a streaming request and return each JSON chunk with its arrival time.
+
+    Arrival times are seconds since the request was sent. ``timeout`` bounds the whole
+    exchange, not each read, so a slow trickle cannot outlive it.
+
+    Args:
+        url (str): The URL to send the request to.
+        body (dict[str, Any]): The JSON-serializable request body.
+        timeout (float): Overall limit in seconds.
+        sse (bool): True for server-sent events (``data:`` lines), False for NDJSON.
+
+    Returns:
+        list[tuple[float, dict[str, Any]]]: Chunks in arrival order.
+
+    Raises:
+        RuntimeError: On HTTP, network, timeout, or malformed-stream failures.
+    """
+    request = Request(
+        url,
+        data=json.dumps(body, allow_nan=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if sse else "application/x-ndjson",
+        },
+        method="POST",
+    )
+    chunks: list[tuple[float, dict[str, Any]]] = []
+    started = time.perf_counter()
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                elapsed = time.perf_counter() - started
+                if elapsed > timeout:
+                    raise RuntimeError(f"Request to {url} failed: timed out")
+                line = raw.decode("utf-8", errors="replace").strip()
+                if sse:
+                    if not line.startswith("data:"):
+                        continue
+                    line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"Runtime sent an invalid stream chunk from {url}") from exc
+                if not isinstance(chunk, dict):
+                    raise RuntimeError(f"Runtime sent a non-object stream chunk from {url}")
+                chunks.append((elapsed, chunk))
+    except HTTPError as exc:
+        detail = exc.read(2000).decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail or exc.reason}") from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Request to {url} failed: {exc}") from exc
+    return chunks
+
+
+def _collect_stream(
+    chunks: list[tuple[float, dict[str, Any]]],
+    text_of: Any,
+    meta_of: Any,
+) -> tuple[str, int | None, dict[str, Any]]:
+    """Join streamed text and derive timings and metadata from the chunks.
+
+    ``ttft_seconds`` is the time from sending the request to the first non-empty text chunk,
+    so it includes any model load and queueing. ``decode_seconds`` runs from the first to the
+    last text chunk. Both are omitted when no text arrived. ``meta_of(chunk)`` may return
+    ``output_tokens``, ``prompt_tokens`` and ``finish_reason``; absent values are omitted.
+    """
+    parts: list[str] = []
+    first = last = None
+    meta: dict[str, Any] = {}
+    for arrived, chunk in chunks:
+        if "error" in chunk:
+            raise RuntimeError(f"Runtime reported a stream error: {chunk['error']}")
+        text = text_of(chunk)
+        if isinstance(text, str) and text:
+            parts.append(text)
+            first = arrived if first is None else first
+            last = arrived
+        meta.update({k: v for k, v in meta_of(chunk).items() if v is not None})
+    extras: dict[str, Any] = {}
+    if first is not None and last is not None:
+        extras = {"ttft_seconds": first, "decode_seconds": last - first}
+    tokens = meta.pop("output_tokens", None)
+    return "".join(parts), tokens, {**extras, **meta}
+
+
+def _count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _text_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _ollama_stream_meta(chunk: dict[str, Any]) -> dict[str, Any]:
+    if chunk.get("done") is not True:
+        return {}
+    return {
+        "output_tokens": _count(chunk.get("eval_count")),
+        "prompt_tokens": _count(chunk.get("prompt_eval_count")),
+        "finish_reason": _text_or_none(chunk.get("done_reason")),
+    }
+
+
+def _openai_stream_meta(chunk: dict[str, Any]) -> dict[str, Any]:
+    raw_usage = chunk.get("usage")
+    usage: dict[str, Any] = raw_usage if isinstance(raw_usage, dict) else {}
+    reason = next(
+        (
+            _text_or_none(choice.get("finish_reason"))
+            for choice in chunk.get("choices") or []
+            if isinstance(choice, dict) and choice.get("finish_reason")
+        ),
+        None,
+    )
+    return {
+        "output_tokens": _count(usage.get("completion_tokens")),
+        "prompt_tokens": _count(usage.get("prompt_tokens")),
+        "finish_reason": reason,
+    }
+
+
+def run_ollama(
+    request: dict[str, Any], endpoint: str, timeout: float, stream: bool = False
+) -> dict[str, Any]:
     """Run a generation or embedding request using the Ollama runtime.
 
     Args:
         request (dict[str, Any]): The generation request.
         endpoint (str): The Ollama API endpoint.
         timeout (float): The request timeout in seconds.
+        stream (bool): Stream the reply and report ``ttft_seconds`` and ``decode_seconds``.
 
     Returns:
         dict[str, Any]: The generation or embedding response.
@@ -666,6 +813,8 @@ def run_ollama(request: dict[str, Any], endpoint: str, timeout: float) -> dict[s
     model = _request_model(request)
     params = _params(request)
     if case.get("task", "generation") == "embedding":
+        if stream:
+            raise ValueError("--stream applies to generation requests only")
         if params:
             _reject_unknown(params, set(), "ollama embedding")
         query, documents = _embedding_inputs(case)
@@ -681,27 +830,37 @@ def run_ollama(request: dict[str, Any], endpoint: str, timeout: float) -> dict[s
         return _embedding_response(vectors, documents)
 
     content, images = _ollama_chat_content(case["input"])
-    options = _ollama_options(params)
+    json_mode = "response_format" in params and _json_mode(params["response_format"])
+    options = _ollama_options({k: v for k, v in params.items() if k != "response_format"})
     message: dict[str, Any] = {"role": "user", "content": content}
     if images:
         message["images"] = images
-    response = _post_json(
-        _api_url(endpoint, "/api/chat"),
-        {"model": model, "messages": [message], "stream": False, "options": options},
-        timeout,
-    )
+    body: dict[str, Any] = {"model": model, "messages": [message], "options": options}
+    if json_mode:
+        body["format"] = "json"
+    if stream:
+        chunks = _post_stream(
+            _api_url(endpoint, "/api/chat"), {**body, "stream": True}, timeout, sse=False
+        )
+        output, tokens, timings = _collect_stream(
+            chunks,
+            lambda chunk: (chunk.get("message") or {}).get("content"),
+            _ollama_stream_meta,
+        )
+        return _finish_generation(request, output, tokens, timings)
+    response = _post_json(_api_url(endpoint, "/api/chat"), {**body, "stream": False}, timeout)
     message_response = response.get("message")
-    output = message_response.get("content") if isinstance(message_response, dict) else None
-    if not isinstance(output, str):
+    reply = message_response.get("content") if isinstance(message_response, dict) else None
+    if not isinstance(reply, str):
         raise RuntimeError("Ollama /api/chat response is missing message.content")
     token_count = response.get("eval_count")
     return _finish_generation(
-        request, output, token_count if type(token_count) is int and token_count >= 0 else None
+        request, reply, token_count if type(token_count) is int and token_count >= 0 else None
     )
 
 
 def run_openai_compatible(
-    request: dict[str, Any], endpoint: str, timeout: float, runtime: str
+    request: dict[str, Any], endpoint: str, timeout: float, runtime: str, stream: bool = False
 ) -> dict[str, Any]:
     """Run a generation or embedding request using an OpenAI-compatible runtime.
 
@@ -710,6 +869,7 @@ def run_openai_compatible(
         endpoint (str): The API endpoint for the OpenAI-compatible runtime.
         timeout (float): The request timeout in seconds.
         runtime (str): The name of the runtime (e.g., "colibri", "llama.cpp").
+        stream (bool): Stream the reply and report ``ttft_seconds`` and ``decode_seconds``.
 
     Returns:
         dict[str, Any]: The generation or embedding response.
@@ -721,6 +881,8 @@ def run_openai_compatible(
     model = _request_model(request)
     params = _params(request)
     if case.get("task", "generation") == "embedding":
+        if stream:
+            raise ValueError("--stream applies to generation requests only")
         if runtime == "colibri":
             raise ValueError("Colibri's documented API does not provide embeddings")
         if params:
@@ -766,6 +928,7 @@ def run_openai_compatible(
                 "seed",
                 "frequency_penalty",
                 "presence_penalty",
+                "response_format",
             },
         )
     body = {
@@ -774,6 +937,26 @@ def run_openai_compatible(
         "stream": False,
         **payload_params,
     }
+    if stream:
+        chunks = _post_stream(
+            _api_url(endpoint, "/v1/chat/completions"),
+            {**body, "stream": True, "stream_options": {"include_usage": True}},
+            timeout,
+            sse=True,
+        )
+        output, tokens, timings = _collect_stream(
+            chunks,
+            lambda chunk: next(
+                (
+                    (choice.get("delta") or {}).get("content")
+                    for choice in chunk.get("choices") or []
+                    if isinstance(choice, dict)
+                ),
+                None,
+            ),
+            _openai_stream_meta,
+        )
+        return _finish_generation(request, output, tokens, timings)
     response = _post_json(_api_url(endpoint, "/v1/chat/completions"), body, timeout)
     return _finish_generation(request, _openai_output(response), _usage_tokens(response))
 
@@ -902,6 +1085,30 @@ def _offline_hub() -> Iterator[None]:
                 os.environ[key] = value
 
 
+AIRLLM_DEFAULT_MAX_NEW_TOKENS = 256
+
+
+def _airllm_prompt(tokenizer: Any, text: str, context: int | None) -> tuple[str, bool]:
+    """Render the tokenizer's chat template if it has one; returns (prompt, templated)."""
+    if not getattr(tokenizer, "chat_template", None):
+        return text, False
+
+    def render(content: str) -> str:
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}], add_generation_prompt=True, tokenize=False
+        )
+
+    if context is not None:
+        # Trim the user text, not the rendered prompt, so the assistant tag is never cut.
+        budget = context - len(tokenizer(render(""), add_special_tokens=False)["input_ids"])
+        if budget < 1:
+            raise ValueError("context is too small for the chat template")
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        if len(ids) > budget:
+            text = tokenizer.decode(ids[:budget], skip_special_tokens=True)
+    return render(text), True
+
+
 def run_airllm(request: dict[str, Any]) -> dict[str, Any]:
     """Run a text generation request using the AirLLM runtime.
 
@@ -936,14 +1143,25 @@ def run_airllm(request: dict[str, Any]) -> dict[str, Any]:
             airllm = importlib.import_module("airllm")
             auto_model: Any = getattr(airllm, "AutoModel")
 
-            model = auto_model.from_pretrained(str(model_path))
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            model = auto_model.from_pretrained(str(model_path), device=device)
             tokenizer = model.tokenizer
-            tokenized = tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=context is not None,
-                **({"max_length": context} if context is not None else {}),
-            )
+            prompt, templated = _airllm_prompt(tokenizer, text, context)
+            if templated:
+                tokenized = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+            else:
+                tokenized = tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    truncation=context is not None,
+                    **({"max_length": context} if context is not None else {}),
+                )
+            generation.setdefault("max_new_tokens", AIRLLM_DEFAULT_MAX_NEW_TOKENS)
+            # Local dirs without generation_config.json never stop at EOS otherwise.
+            eos_id = getattr(tokenizer, "eos_token_id", None)
+            if type(eos_id) is int:
+                generation.setdefault("eos_token_id", eos_id)
+                generation.setdefault("pad_token_id", eos_id)
             input_ids = tokenized["input_ids"]
             if torch.cuda.is_available():
                 input_ids = input_ids.cuda()
@@ -976,6 +1194,7 @@ def adapt(
     runtime: str,
     endpoint: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    stream: bool = False,
 ) -> dict[str, Any]:
     """Run one runtime adapter for a parsed harness request.
 
@@ -984,6 +1203,7 @@ def adapt(
         runtime (str): The name of the runtime to use.
         endpoint (str | None): The endpoint URL for the runtime, if applicable.
         timeout (float): The request timeout in seconds.
+        stream (bool): Stream the reply to measure time to first token (Ollama and llama.cpp).
 
     Returns:
         dict[str, Any]: The response from the runtime adapter.
@@ -998,6 +1218,8 @@ def adapt(
         raise ValueError("The request must be a JSON object")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be a finite positive number")
+    if stream and runtime not in ("ollama", "llama.cpp"):
+        raise ValueError("--stream is supported for ollama and llama.cpp only")
     case = _case(request)
     if (
         case.get("task", "generation") == "generation"
@@ -1013,8 +1235,8 @@ def adapt(
         return run_airllm(request)
     base = _endpoint_for(runtime, endpoint)
     if runtime == "ollama":
-        return run_ollama(request, base, timeout)
-    return run_openai_compatible(request, base, timeout, runtime)
+        return run_ollama(request, base, timeout, stream)
+    return run_openai_compatible(request, base, timeout, runtime, stream)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1035,6 +1257,11 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_TIMEOUT,
         help=f"HTTP request timeout in seconds (default: {DEFAULT_TIMEOUT:g})",
     )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="stream the reply and add ttft_seconds/decode_seconds (ollama, llama.cpp)",
+    )
     args = parser.parse_args(argv)
     try:
         if args.runtime == "airllm" and args.endpoint is not None:
@@ -1042,7 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.runtime != "airllm":
             _endpoint_for(args.runtime, args.endpoint)
         request = json.load(sys.stdin)
-        response = adapt(request, args.runtime, args.endpoint, args.timeout)
+        response = adapt(request, args.runtime, args.endpoint, args.timeout, args.stream)
         sys.stdout.write(json.dumps(response, allow_nan=False, separators=(",", ":")) + "\n")
         return 0
     except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:

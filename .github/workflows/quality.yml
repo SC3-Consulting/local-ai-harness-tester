@@ -17,8 +17,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m isort --check-only harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py tests examples
-      - run: python -m black --check harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py tests examples
-      - run: python -m pylint harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py
+      - run: python -m isort --check-only harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py auto_tuner.py tests examples
+      - run: python -m black --check harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py auto_tuner.py tests examples
+      - run: python -m pylint harness_tester.py evaluations.py hardware.py web_ui.py runtime_adapters.py auto_tuner.py
       - run: python -m mypy
       - run: python -m pytest -q

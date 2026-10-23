@@ -25,6 +25,24 @@ defaults to 300 seconds. The exported `validate_endpoint(endpoint: str) -> str`
 helper performs synchronous, no-network URL preflight and returns the
 normalized HTTP(S) URL; it rejects credentials, query strings, and fragments.
 
+`--stream` is optional and applies to generation requests for Ollama and
+llama.cpp only; other runtimes and embedding requests reject it. The adapter
+then requests a streamed reply and adds `ttft_seconds` (request sent to first
+non-empty text chunk, including any model load and queueing) and
+`decode_seconds` (first to last text chunk) to the response. If the runtime
+sends no text, both fields are omitted. `output_tokens` is taken from Ollama's
+`eval_count` or from the OpenAI-style `usage` chunk requested with
+`stream_options.include_usage`; it is omitted if the server does not send it.
+When the server reports them, a streamed response also includes `prompt_tokens`
+(Ollama `prompt_eval_count`, or the OpenAI-style `usage.prompt_tokens`) and
+`finish_reason` (`stop` or `length`). Without `--stream` the response is unchanged.
+The `--timeout` limit applies to the whole streamed exchange.
+
+The optional parameter `response_format` accepts only `"json"` and is supported
+by Ollama and llama.cpp. It is sent as Ollama's top-level `format: "json"` or as
+llama.cpp's `response_format: {"type": "json_object"}`. Other values, and the
+parameter on any other runtime, are rejected.
+
 ## Request/response behavior
 
 Requests use the harness JSON protocol: `model`, `harness`, `parameters`,
